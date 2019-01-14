@@ -1,0 +1,680 @@
+---
+title: "Steps"
+author: "Alexander Turner"
+output: html_document
+---
+
+## Required Packages
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(ggridges)
+library(ggmosaic)
+library(XML)
+library(rlang)
+```
+
+## Intro
+
+A few years ago someone pointed out to me that iPhones record step and distance data automatically and you can check the daily results via the [__Health app__](https://support.apple.com/en-au/HT203037). It's also no secret that the last few years has featured an increased focus on how [__leading a sedentary life working at a desk can be bad for your health and people should strive for 10,000 steps per day__](https://www.abc.net.au/news/health/2017-05-17/10000-steps-is-it-enough/8532768). If you bother to read the article, it is clear 10,000 steps isn't a magic or even necessary number but it's also clear that a lot of people don't reach the daily step totals they should be. I have put in a big effort to get my steps up and was curious to see what the data had to say about my improvement. This piece of work involves some brief analysis and visualisation of my step data from mid-2015 (21/08/2015 to be precise) to now (last day of 2018).
+
+It's also worth noting before starting that the step data recorded by the phone couldn't be entirely accurate as this is obviously not the primary function of the device. Additionally, it would seem reasonable to think the phone would record consistently lower step totals than are actually being taken every day, because I don't have my phone on me at all times. For this reason it seems wiser to focus on the trends in the data, rather than on the absolute figures. 
+
+## Data
+
+```{r}
+# data import
+health_xml <- xmlParse("export.xml")
+
+# convert the XML to a list
+health <- health_xml %>% xmlToList()
+
+# list structure
+health %>% str(list.len = 10)
+```
+
+
+## Digging into the List
+
+At a glance it seems like the list contains the export date and personal information in the first 4 elements then a record of step counts etc in the following elements. It seems a bit odd there are some elements named "Record" which contain information relating to height etc when this is seemingly also the name for elements containing the data related to steps etc recorded by the device. It does seem to be a reasonably neat list though, so extracting the information needed shouldn't be too tricky. 
+
+```{r}
+# confirm the element names 
+health %>% 
+  names() %>% 
+  unique()
+```
+
+```{r}
+# confirm all elements are character vectors
+health %>% 
+  map_lgl(is.character) %>% 
+  all()
+```
+
+Checking the names confirms the names shown above are the only names for the list elements (which are all character vectors). Now to dig one layer deeper and check the names of each list element. 
+
+```{r}
+# check names of the character vector of each element
+health %>%
+  magrittr::extract(names(health) == "Record") %>% 
+  map(~ attr(., "names")) %>%
+  unlist() %>%
+  unique()
+```
+
+Value, type unit seem to be of interest here - let's have a look.
+
+```{r}
+# check all types
+health %>%
+  map("type") %>% 
+  unlist() %>% 
+  unique() 
+```
+
+```{r}
+# check all units
+health %>%
+  map("unit") %>% 
+  unlist() %>% 
+  unique() 
+```
+
+```{r}
+# check first 10 "values"
+health %>%
+  map("value") %>% 
+  unlist() %>% 
+  magrittr::extract(1:10)
+```
+
+It appears the list elements contain, along with a bunch of other information, a type that identifies what the record's data is related to, a unit measure for the data recorded and, of course, a value. Before proceeding, I'm just going to double-check everything is at it seems by inspecting 2 elements of interest. 
+
+```{r}
+# steps check
+health %>% magrittr::extract(map_lgl(., ~ "HKQuantityTypeIdentifierStepCount" %in% .)) %>% 
+  magrittr::extract(1)
+
+# distance check
+health %>% magrittr::extract(map_lgl(., ~ "HKQuantityTypeIdentifierDistanceWalkingRunning" %in% .)) %>% 
+  magrittr::extract(1)
+```
+
+Seems all good.
+
+Inspecting the list elements also gives a bit more insight into the date fields. It appears "startDate" refers to when the activity begun, "endDate" when it finished and "creationDate" perhaps when it is recorded by the device. It doesn't really matter anyway, as I am going to use "endDate" as the timestamp for my data as it seems to make the most sense - it indicates the conclusion of the activity being recorded.
+
+## Data Preprocessing
+
+Now the list is better understood, the data can be put into [__tidy__](https://www.jstatsoft.org/article/view/v059i10) data frames for analysis and plots. To begin I'm going to extract the step and distance into separate "raw" format data frames where every row is for an individual timestamp produced by the "endDate" field. It might make more sense to put all of the step and distance data into the one data frame but for some unknown reason the two metrics don't have matching timestamps, which makes things tricky. 
+
+```{r message=FALSE}
+# create vector for "types"
+types <- health %>% 
+  map("type") %>% 
+  unlist() %>% 
+  unique()
+
+# create index for steps
+steps_index <- health %>% 
+  map_lgl(~ types[3] %in% .)
+
+# extract all list elements for step data
+steps <- health[steps_index]
+
+# extract all step count data
+step_counts <- steps %>% 
+  map("value") %>% 
+  as.integer() %>% 
+  unname()
+
+# extract all timestamps and convert to melb datetime
+steps_time_stamps <- steps %>%  
+  map_chr("endDate") %>% 
+  unname() %>% 
+  ymd_hms(tz = "Australia/Melbourne")
+
+# create data frame of steps data
+steps_df <- tibble(
+  time_stamp = steps_time_stamps,
+  date = time_stamp %>% as_date(),
+  step_counts = step_counts
+)
+
+steps_df
+```
+
+```{r message=FALSE}
+# create index for distances
+distances_index <- health %>% 
+  map_lgl(~ types[4] %in% .)
+
+# extract all list elements for distance data
+distances <- health[distances_index]
+
+# extract all distance covered data
+distance_covered <- distances %>% 
+  map("value") %>%
+  as.numeric() %>% 
+  unname()
+
+# extract all timestamps and convert to melb datetime
+distances_time_stamps <- distances %>% 
+  map_chr("endDate") %>% 
+  unname() %>% 
+  ymd_hms(tz = "Australia/Melbourne")
+
+# create data frame of distances data
+distances_df <- tibble(
+  time_stamp = distances_time_stamps,
+  date = time_stamp %>% as_date(),
+  distance_covered = distance_covered
+)
+
+distances_df
+```
+
+Now to collapse these data frames so each row is a single day and add some additional variables based on the timestamps.
+
+```{r}
+# create summarised steps data frame
+steps_summary <- steps_df %>% 
+  group_by(date) %>% 
+  summarise(total_steps = step_counts %>% sum()) %>% 
+  mutate(year = date %>% year() %>% factor(),
+         month = date %>% month() %>% factor(),
+         day_of_week = date %>% wday(label = T, week_start = 1) %>% factor(ordered = F), 
+         weekday_weekend = if_else(day_of_week %in% c("Sat", "Sun"), "Weekend", "Week Day") %>% factor())
+
+steps_summary
+
+# create summarised distances data frame
+distances_summary <- distances_df %>% 
+  group_by(date) %>% 
+  summarise(total_distance = distance_covered %>% sum()) %>% 
+  mutate(year = date %>% year() %>% factor(),
+         month = date %>% month() %>% factor(),
+         day_of_week = date %>% wday(label = T, week_start = 1) %>% factor(ordered = F), 
+         weekday_weekend = if_else(day_of_week %in% c("Sat", "Sun"), "Weekend", "Week Day") %>% factor())
+
+distances_summary
+```
+
+The remainder of the data preprocessing will focus on the step data as it will be the primary data used for analysis (the distances data will only be used for a single plot, so some potential minor data quality issues are fine).
+
+As a data quality check, let's confirm all the dates are there and all the step totals appear valid.
+
+```{r}
+# date check
+steps_summary %>% 
+  group_by(year) %>% 
+  count()
+
+# check all dates have valid data
+steps_summary %>% filter(total_steps <= 0)
+
+# check no totals are too high
+steps_summary %>% arrange(desc(total_steps))
+```
+
+Step totals appear fine, but there do seem to be some missing dates. After exporting the data a few times over the course of this project I've noticed that for some reason it never quite works properly as some dates are always missing. To investigate, I'm first going to put all the missing dates into a data frame and inspect it. 
+
+```{r}
+# create for all dates across period data was recorded
+all_dates <- seq.Date(steps_summary$date[1], steps_summary$date[nrow(steps_summary)], by = 1) %>% 
+  enframe(name = NULL) %>% 
+  rename(date = value)
+
+# extract missing dates
+missing_dates <- all_dates %>% 
+  anti_join(steps_summary, by = "date")
+
+missing_dates
+```
+
+Next let's add in the days before and after the missing dates to see if they have some peculiar data. 
+
+```{r}
+# add days 
+missing_dates <- missing_dates %>% 
+  mutate(day_before = date - days(1), 
+         day_after = date + days(1))
+
+# check days before & after
+steps_summary %>% 
+  filter(date %in% missing_dates$day_before | date %in% missing_dates$day_after)
+```
+
+It seems the days before and after the missing dates have some odd step counts. May 29th for example has a total of 33 steps, which is way too low to be correct. As a quick-and-dirty fix I'm going to impute these values with the mean (including the data points that don't appear to be that odd, just to be safe). If this data was being used for a model or more sophisticated analysis this mean imputation could be problematic but for simple analysis it is fine, particularly considering there are so few data points being altered. 
+
+For the dates missing altogether the same technique of mean imputation will be used to make the data complete. The mean will be slightly different though as it is calculated with the altered data for the before / after missing dates days, but again this isn't an issue as I'm going to change the values again in the next preprocessing phase. 
+
+```{r}
+# replace total_steps data for days before and after missing dates with mean
+steps_summary <- steps_summary %>% 
+  mutate(
+    total_steps = if_else(
+      date %in% (missing_dates %>% pull(day_before)) | date %in% (missing_dates %>% pull(day_after)),
+      steps_summary$total_steps %>% mean() %>% as.integer(),
+      total_steps
+    )
+  ) 
+
+# create data frame for missing dates with mean for total_steps
+missing_date_data <- missing_dates %>% 
+  select(date) %>% 
+  mutate(total_steps = steps_summary$total_steps %>% mean() %>% as.integer(),
+         year = date %>% year() %>% factor(levels = levels(steps_summary$year)),
+         month = date %>% month() %>% factor(levels = 1:12),
+         day_of_week = date %>% wday(label = T, week_start = 1) %>% factor(ordered = F),
+         weekday_weekend = if_else(day_of_week %in% c("Sat", "Sun"), "Weekend", "Week Day") %>% factor())
+
+# append missing date and re-order data frame based on date
+steps_summary <- steps_summary %>% 
+  bind_rows(missing_date_data) %>% 
+  arrange(date)
+```
+
+```{r}
+# check data is now complete
+steps_summary %>% 
+  group_by(year) %>% 
+  count()
+```
+
+366 is in fact correct for 2016 as [__it was a leap year__](https://kalender-365.de/leap-years.php).
+
+Before proceeding with the analysis I am going to quickly apply a change to the data points subject the mean imputation as having the same value repeated often messes up some of the charts to follow. 
+
+The code below updates the values by adding or subtracting a value within one +/- standard deviation of step count data. This should create realistic values that aren't duplicated. Again, not necessarily something you would recommend feeding into a model but for this analysis and for very few data points it is sufficient.  
+
+```{r}
+# create an index of days to update
+update_index <- steps_summary$date %>% 
+  map_lgl(~ . %in% missing_dates$date | . %in% missing_dates$day_before | . %in% missing_dates$day_after) 
+
+# create a vector of updated values
+update_values <- steps_summary$total_steps[update_index] %>% 
+  map_int(
+    ~ (. + sample(-sd(steps_summary$total_steps):sd(steps_summary$total_steps), 1)) %>% 
+      as.integer()
+  ) 
+
+# update values
+steps_summary <- steps_summary %>% 
+  mutate(total_steps = replace(total_steps, update_index, update_values))
+
+# data - ready to use
+steps_summary
+```
+
+Now the data is ready for analysis!
+
+The data frame contains the date, total steps and then 4 factor variables extracted from the date. 
+
+As a final action before analysis, all data for 2019 will be removed as it only has ~7 days old. 
+
+```{r}
+# remove 2019 data
+steps_summary <- steps_summary %>% 
+  filter(year != 2019) %>% 
+  mutate(year = year %>% fct_drop())
+```
+
+
+## Data Summary
+
+Let's kick of with some basic summary stats by each of the categorical variables 
+
+```{r}
+# remove scientific notation
+options(scipen = 999)
+
+# mean
+steps_summary$total_steps %>% mean()
+
+# standard deviation
+steps_summary$total_steps %>% sd()
+```
+
+My daily average is almost 6,500. Not quite the "magic" 10,000, but not bad. The standard deviation of ~3,000 shows there is considerable variation in the data. 
+
+Now for the same statistics, but by each factor variable. 
+
+```{r}
+# create summary stats function
+summary_fun <- function(variable) {
+  quo_variable <- enquo(variable)
+  
+  steps_summary %>% 
+    group_by(!!quo_variable) %>% 
+    summarise(mean = total_steps %>% mean(),
+              sd = total_steps %>% sd()) 
+}
+
+# extract variable names
+var_names <- colnames(steps_summary %>% select(year:weekday_weekend)) %>% 
+  syms()
+
+# summary stats
+var_summary <- var_names %>% 
+  map(summary_fun) 
+
+var_summary
+```
+
+From 2015 to 2018 there was an improvement each year. Looking at the day of week data shows Sunday is my laziest day while Friday stands out as a day when I seem to get a lot more steps than others. 
+
+## Plots
+
+The summary stats tables are nice but plots will give a lot more insight into the data and allow for easy exploration. I've split the plots into basic summaries, by year, by month, by day of week and then a random assortment at the end. 
+
+## Summary Plots
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+# create plot function
+bar_plot <- function(variable) {
+  quo_variable <- enquo(variable)
+  quo_text <- quo_text(quo_variable) %>% 
+    str_replace_all("_", " ") %>% 
+    tools::toTitleCase()
+  
+  steps_summary %>% 
+    group_by(!!quo_variable) %>% 
+    summarise(mean_steps = total_steps %>% mean()) %>% 
+    ggplot(aes(!!quo_variable, mean_steps)) +
+    geom_col(position = "dodge") +
+    labs(title = paste("Mean Steps by", quo_text),
+         x = quo_text,
+         y = "Total Steps") +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+
+# summary plots
+var_names %>% map(bar_plot)
+```
+
+
+## Years
+
+Starting off with a histogram featuring all the data, with a line for the mean (the mean line can have a legend in `ggplot2` as you can see in my footy tipping project, but I find it cumbersome to add). 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+title_adjust <- theme(plot.title = element_text(hjust = 0.5))
+
+steps_summary %>% 
+  ggplot(aes(total_steps)) +
+  geom_histogram(binwidth = 200) +
+  geom_vline(xintercept = mean(steps_summary$total_steps), colour = "dodgerblue", size = 2) +
+  labs(title = "Total Steps Histogram",
+       x = "Total Steps",
+       y = "Count") +
+  title_adjust
+```
+
+Let's split by year to see how the shape of histogram has changed over time. The blue line now indicates the overall mean (as seen on the previous chart) and the red lines are the mean for each year. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>%
+  ggplot(aes(total_steps)) +
+  geom_histogram(binwidth = 200) +
+  geom_vline(xintercept = mean(steps_summary$total_steps), colour = "dodgerblue", size = 2) +
+  facet_grid(year ~ .) +
+  geom_vline(data = var_summary[[1]], aes(xintercept = mean), colour = "red", size = 2) +
+  labs(title = "Total Steps Histograms by Year",
+       x = "Total Steps",
+       y = "Count") +
+  title_adjust
+```
+
+The trend is clear, back in 2015 & 2016 a lot of my step totals were < 5,000 but now this mark is consistently eclipsed, particularly in 2018. The histograms also clearly show the data for 2015 is incomplete.
+
+Now, for a final iteration of the histogram featuring a colour fill for the week day-weekend variable. The overall mean is now indicated with a black line. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>%
+  ggplot(aes(total_steps, fill = weekday_weekend)) +
+  geom_histogram(binwidth = 200) +
+  geom_vline(xintercept = mean(steps_summary$total_steps), size = 2) +
+  scale_fill_brewer(palette = "Dark2") +
+  facet_grid(year ~ .) +
+  labs(title = "Total Steps Histogram by Year",
+       x = "Total Steps",
+       y = "Count",
+       fill = "") +
+  title_adjust
+```
+
+It's clear that, especially in 2018, weekends make up the majority of the lowest totals. I do have some lazy Sundays, and the data backs that up. 
+
+It also seems like over the period 2015 to 2018 most of my improvement has been on week days, rather than weekends. A simple line chart can help confirm this.
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>% 
+  group_by(year, weekday_weekend) %>% 
+  summarise(mean = mean(total_steps)) %>% 
+  ggplot(aes(year, mean, group = weekday_weekend, colour = weekday_weekend)) +
+  geom_line(size = 2) +
+  scale_colour_brewer(palette = "Dark2") +
+  scale_y_continuous(limits = c(0, 8000)) +
+  labs(title = "Trended Mean Total Steps",
+       x = "Year",
+       y = "Mean",
+       colour = "") +
+  title_adjust
+```
+
+It's clear that all the improvement I've seen in my average daily step counts has been achieved through improvements on week days.
+
+## Months
+
+Again, going with histograms but this time split by month with the overall mean shown with the dotted line. Using `geom_density_ridges` from the `ggridges` packages allows for slightly more compact histograms than a `ggplot2` facet. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+month_ridge_1 <- steps_summary %>% 
+  filter(month %in% 1:6) %>% 
+  ggplot(aes(total_steps, fct_rev(month))) +
+  geom_density_ridges(stat = "binline", bins = 50, size = 0.2, scale = 1, fill = "seagreen1") +
+  geom_vline(xintercept = mean(steps_summary$total_steps), linetype = "dotted", size = 1) +
+  labs(title = "January - June Total Steps Histograms",
+       x = "Total Steps",
+       y = "Month") +
+  title_adjust
+
+
+month_ridge_2 <- steps_summary %>% 
+  filter(month %in% 7:12) %>% 
+  ggplot(aes(total_steps, fct_rev(month))) +
+  geom_density_ridges(stat = "binline", bins = 50, size = 0.2, scale = 1, fill = "seagreen1") +
+  geom_vline(xintercept = mean(steps_summary$total_steps), linetype = "dotted", size = 1) +
+  labs(title = "July - December Total Steps Histograms",
+       x = "Total Steps",
+       y = "Month") +
+  title_adjust
+
+cowplot::plot_grid(month_ridge_1, month_ridge_2)
+```
+
+Unlike the data for the years, there isn't any patterns jumping out. This makes sense though, as my schedule is fairly consistent month-to-month even with uni etc. 
+
+Combining year and month in plot might yield some information though. Swapping to a box as it is well-suited to this approach. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>% 
+  filter(year != 2015) %>% # remove 2015 as it is incomplete
+  ggplot(aes(month, total_steps, fill = year)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Total Steps Box Plots by Month",
+       x = "Month",
+       y = "Total Steps",
+       fill = "Year") +
+  title_adjust
+```
+
+This gives some better insight. I'm not going to try and unpack everything on the box plot but one thing that stands out to me is that the [__interquartile range__](https://en.wikipedia.org/wiki/Interquartile_range) really grows throughout 2016 and then for 2017 & 2018 it is seemingly more steady with some random noise. This chart also reinforces the previous histograms, with the median typically rising for each year from 2016 to 2018 (this isn't always the case, though).
+
+## Day of Week
+
+Again, beginning with a histogram featuring a dotted line for the overall mean. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>% 
+  ggplot(aes(total_steps, fct_rev(day_of_week))) +
+  geom_density_ridges(stat = "binline", bins = 80, size = 0.2, scale = 1, fill = "lightcoral") +
+  geom_vline(xintercept = mean(steps_summary$total_steps), linetype = "dotted", size = 1) +
+  labs(title = "Total Steps Histograms by Day of Week",
+       x = "Total Steps",
+       y = "Day of Week") +
+  title_adjust
+```
+
+Monday - Thursday is relatively consistent in terms of spread of data and the number of points above and below the mean. Friday - Sunday is a different story though. Friday has the majority of its data above the mean, Saturday is the most spread of all days and then Sunday features a lot of data points well below the mean. 
+
+I'm again going to go back to the box plot with year again to get some extra information out of this variable. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>% 
+  filter(year != 2015) %>% # remove incomplete year
+  ggplot(aes(day_of_week, total_steps, fill = year)) +
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Total Steps Box Plots by Day of Week",
+       x = "Day of Week",
+       y = "Total Steps",
+       fill = "Year") +
+  title_adjust
+```
+
+The box plot is again very informative when layered with the year variable. Friday has always been a consistently high day, even back in 2016. Tuesday and Wednesday were big improvers for 2018 vs 2017, while Monday and Sunday fell away.
+
+## Some of Everything
+
+Now to show off some of the other cool things `ggplot2` and its many extenstions can do and put together some other charts this kind of data is well-suited to.
+
+The first plot involves probably the most simple plotting of this data: a line plot with total steps by day. I'll also add in a 30-day rolling mean and use `ggforce` to zoom in on part of the plot.
+
+```{r fig.align='center', fig.width=10, fig.height=12, warning=FALSE, message=FALSE}
+# create rolling mean vector
+rolling_mean <- RcppRoll::roll_mean(steps_summary$total_steps, n = 30)
+
+# calculate end of vector to be filled with NA values 
+# rolling 30 day mean cannot be calculated for final 29 days
+diff <- nrow(steps_summary) - length(rolling_mean)
+
+# fill in vector
+rolling_mean <- c(rolling_mean, rep(NA, diff))
+names(rolling_mean) <- steps_summary$date
+
+steps_summary %>% 
+  ggplot(aes(date, total_steps)) +
+  geom_line() +
+  geom_line(data = steps_summary %>% mutate(y = rolling_mean),
+            aes(date, y),
+            colour = "dodgerblue",
+            size = 2) +
+  ggforce::facet_zoom(date %in% seq.Date(as_date("2018-01-01"), as_date("2018-06-30"), by = 1)) +
+  scale_y_continuous(breaks = seq(0, 20000, by = 1000)) +
+  labs(title = "Total Steps by Day with Rolling 30 Day Mean",
+       x = "Day",
+       y = "Total Steps") +
+  title_adjust
+```
+
+One thing I've also been curious about was how well the total steps correlates with distance covered. I've always assumed days where I went for a run resulted in higher distance but not necessarily as many steps as if I've covered the same amount of ground walking. Creating a scatter plot of total steps vs total distance is hardly impressive but `ggplot2` has the `alpha` aesthetic which allows us to see more common data points and the line of best can be fitted easily and the simple linear regression equation and $R^2$ can be added to the plot with the help of `ggpmisc`. 
+
+```{r fig.align='center', fig.width=10, fig.height=6, warning=FALSE, message=FALSE}
+steps_summary %>% 
+  inner_join(distances_summary, by = "date") %>%
+  # remove days with data imputed
+  filter(!(date %in% missing_dates$date | date %in% missing_dates$day_before | date %in% missing_dates$day_after)) %>% 
+  ggplot(aes(total_steps, total_distance)) +
+  geom_point(size = 2, alpha = 0.25) +
+  geom_smooth(method = lm, se = F, colour = "firebrick1") +
+  ggpmisc::stat_poly_eq(formula = y ~ x, 
+                        aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")), 
+                        parse = T) +
+  labs(title = "Total Steps vs Total Distance",
+       x = "Total Steps",
+       y = "Total Distance") +
+  title_adjust
+```
+
+Obviously, the correlation is very high but there is still some variation. After ~5,000 steps I sometimes have covered ~3km but other times the distance is almost ~5km, a difference of ~65%. 
+
+Next is one of my favourite plots: the heatmap. These can be done easily with `ggplot2` like below.
+
+```{r fig.align='center', fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+# create cross tab data frame
+year_day_xtab <- steps_summary %>% 
+  xtabs(total_steps ~ year + day_of_week, data = .) %>% 
+  as_tibble() %>% 
+  filter(year != 2015) %>% # remove incomplete year
+  mutate(year = year %>% factor(),
+         day_of_week = day_of_week %>% factor(levels = steps_summary$day_of_week %>% levels()))
+
+year_day_xtab %>% 
+  ggplot(aes(year, fct_rev(day_of_week), fill = n)) +
+  geom_raster() +
+  scale_fill_gradient(low = "white", 
+                      high = "violetred4",
+                      limits = c(0, max(year_day_xtab$n))) +
+  labs(title = "Total Steps by Year & Day of Week Heatmap",
+       x = "Year",
+       y = "Day of Week",
+       fill = "Total Steps") +
+  guides(fill = guide_colourbar(ticks = F)) +
+  title_adjust
+```
+
+They can also be built to add things like a calendar view with `ggTimeSeries`. 
+
+```{r fig.align='center', fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+steps_summary %>% 
+  filter(year != 2015) %>% # remove incomplete year
+  ggTimeSeries::ggplot_calendar_heatmap("date", "total_steps") +
+  facet_wrap(~ Year, ncol = 1) +
+  scale_fill_continuous(low = "green", high = "red") +
+  labs(title = "Total Steps by Year & Individual Day Heatmap",
+       x = "Month",
+       y = "Day of Week",
+       fill = "Total Steps") +
+  guides(fill = guide_colourbar(ticks = F)) +
+  title_adjust
+```
+
+While a plot like this would be best-suited to seasonal data, it does do a good job of showing the improvement from 2016 to 2018 in terms of steps. 
+
+Next up is the jitter plot. A jitter plot is a point plot that adds some random variation to each point to avoid over-plotting that would occur if a simple point plot was used for the below. 
+
+```{r fig.align='center', fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+steps_summary %>%
+  filter(year != 2015) %>% 
+  ggplot(aes(day_of_week, total_steps, colour = day_of_week)) +
+  geom_jitter(width = 0.2) +
+  facet_wrap(~ year) +
+  labs(title = "Total Steps by Year & Day of Week Jitter Plot",
+       x = "Day of Week",
+       y = "Total Steps") +
+  guides(colour = F) +
+  title_adjust
+```
+
+This plot really shows how much I avoided low step days on Tuesdays and Wednesdays in 2018 but really piled up low totals on Sundays.
+
+The final plot is a [__mosaic plot__](https://en.wikipedia.org/wiki/Mosaic_plot), another plot type I'm a big fan of. This essentially gives a similar insight to the 1st heatmap, showing the totals for the cross-tab between 2 categorical variables (in this case year and day of week).
+
+```{r fig.align='center', fig.height=6, fig.width=10, message=FALSE, warning=FALSE}
+year_day_xtab %>% 
+  ggplot() +
+  geom_mosaic(aes(x = product(day_of_week), weight = n, fill = year)) +
+  labs(title = "Total Steps by Year & Day of Week Mosaic Plot",
+       x = "Day of Week",
+       y = "Year") +
+  guides(fill = F) +
+  title_adjust
+```
+
+Hopefully this has shown off some of the cool things R and `ggplot2` can do with such a simple dataset like this.

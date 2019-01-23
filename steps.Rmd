@@ -1,5 +1,5 @@
 ---
-title: "Steps"
+title: "An Analysis of my Steps"
 author: "Alexander Turner"
 output: html_document
 ---

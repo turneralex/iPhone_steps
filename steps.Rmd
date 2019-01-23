@@ -59,7 +59,7 @@ Checking the names confirms the names shown above are the only names for the lis
 # check names of the character vector of each element
 health %>%
   magrittr::extract(names(health) == "Record") %>% 
-  map(~ attr(., "names")) %>%
+  map(names) %>%
   unlist() %>%
   unique()
 ```
